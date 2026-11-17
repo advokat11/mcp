@@ -10,7 +10,7 @@ from __future__ import annotations
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import InputRequiredResult
 
-from .toolkit import DESTRUCTIVE, RO, choose, run_text, run_text_confirmed, token
+from .toolkit import DESTRUCTIVE, RO, choose, events_safe, run_text, run_text_confirmed, token
 
 _ON_OFF = {"on": "on", "off": "off"}
 
@@ -55,6 +55,8 @@ def register_events(mcp: MCPServer, *, read_only: bool) -> None:
     async def hd_event_clear(target: str, ctx: Context) -> str | InputRequiredResult:
         """Clear event(s) by target: an event id (hex) or `all`."""
         cmd = f"events c {token(target, 'target')}"
+        # Removing an EPT hook broadcasts to every core like setting one does.
+        events_safe(ctx, "clear events")
         return await run_text_confirmed(
             ctx,
             cmd,

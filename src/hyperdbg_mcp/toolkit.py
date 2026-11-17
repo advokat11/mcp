@@ -227,6 +227,16 @@ def parsed_script(ctx: Context, script: str) -> str:
     return script
 
 
+def events_safe(ctx: Context, what: str) -> None:
+    """Refuse an event change that would hang the machine (see require_events_safe).
+
+    Sessions without the check (test fakes, --mock) skip it.
+    """
+    check = getattr(app_ctx(ctx).session, "require_events_safe", None)
+    if check:
+        check(what)
+
+
 _CONFIRM_KEY = "confirm"
 
 

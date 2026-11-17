@@ -11,12 +11,13 @@ from __future__ import annotations
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import InputRequiredResult
 
-from .errors import HyperDbgError
+from .errors import HyperDbgError, PreconditionError
 from .toolkit import (
     DESTRUCTIVE,
     STATE,
     bracket_body,
     choose,
+    events_safe,
     output_names,
     parse_addr,
     parsed_script,
@@ -24,6 +25,9 @@ from .toolkit import (
     run_text,
     run_text_confirmed,
 )
+
+# Lowest canonical kernel-half address on x64.
+_KERNEL_BASE = 0xFFFF800000000000
 
 _STAGES = {"pre": "pre", "post": "post", "all": "all"}
 _MONITOR_ATTRS = {a: a for a in ("r", "w", "x", "rw", "rx", "wx", "rwx")}
@@ -58,7 +62,10 @@ def _suffix(
 
     The script is parsed by HyperDbg's parser first: a typo then fails here with
     its line and column, not after the confirmation, half-way into the command.
+    Every hook builds its command here, so this is also where an event that
+    would hang the machine (a user-mode process paused in VMI mode) is refused.
     """
+    events_safe(ctx, "set an event")
     parts = []
     if pid:
         parts.append(f" pid {pid:#x}")
@@ -77,7 +84,9 @@ def _suffix(
 
 _SCRIPT_DOC = """
 
-script= runs a HyperDbg script on every hit, on the target (any mode). It is
+script= runs a HyperDbg script on every hit, on the target (VMI or Debugger
+Mode); in VMI mode an event needs one. Events can't be set while a user-mode
+process is paused in VMI mode (hd_exec_continue first). It is
 parsed before anything is set. hd_script_template builds common ones (log
 arguments, count hits, log/break/drop on a condition); hd_script_cookbook
 lists the syntax and functions. No // or /* */ comments and no backslash
@@ -114,7 +123,10 @@ def register_hooks(mcp: MCPServer, *, read_only: bool) -> None:
         stage: str = "",
         short_circuit: bool = False,
     ) -> str | InputRequiredResult:
-        """Set EPT (Extended Page Tables) hook at address (hex string)."""
+        """Set EPT (Extended Page Tables) hook at address (hex string).
+
+        A hidden breakpoint: works on user-mode code (pass pid) and kernel code.
+        """
         addr = resolve_addr(ctx, address)
         cmd = f"!epthook {addr:#x}" + _suffix(
             ctx, pid, core, script, stage, short_circuit, output=output
@@ -139,8 +151,20 @@ def register_hooks(mcp: MCPServer, *, read_only: bool) -> None:
         stage: str = "",
         short_circuit: bool = False,
     ) -> str | InputRequiredResult:
-        """Set EPT2 (Extended Page Tables 2) hook at address (hex string)."""
+        """Set EPT2 (Extended Page Tables 2) detour hook at address (hex string).
+
+        Kernel addresses only: the detour jumps to a handler inside the
+        hypervisor driver, so on user-mode code the process crashes. For user-mode
+        code use hd_hook_ept.
+        """
         addr = resolve_addr(ctx, address)
+        if addr < _KERNEL_BASE:
+            raise PreconditionError(
+                f"{addr:#x} is a user-mode address: hd_hook_ept2 detours to a kernel-mode "
+                "handler, which crashes the process (c0000005 at "
+                "hyperhv!AsmGeneralDetourHook, HyperDbg/HyperDbg#712). Use hd_hook_ept "
+                "(with pid) for user-mode code."
+            )
         cmd = f"!epthook2 {addr:#x}" + _suffix(
             ctx, pid, core, script, stage, short_circuit, output=output
         )

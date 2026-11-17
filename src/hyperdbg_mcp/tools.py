@@ -29,7 +29,14 @@ from pydantic import BaseModel, Field
 
 from .errors import HyperDbgError
 from .safety import wrap_untrusted
-from .script import COOKBOOK, TEMPLATE_KINDS, TemplateKind, build_template, read_only_script
+from .script import (
+    COOKBOOK,
+    TEMPLATE_KINDS,
+    TemplateKind,
+    build_template,
+    read_only_script,
+    unbounded_constructs,
+)
 from .toolkit import (
     choose,
     denial,
@@ -141,10 +148,10 @@ def register_tools(mcp: MCPServer, *, read_only: bool) -> None:
         return hex(value)
 
     @mcp.tool(name="hd_script_eval", annotations=_RO)
-    def hd_script_eval(
+    async def hd_script_eval(
         script: Annotated[str, Field(description="HyperDbg script that only reads and prints")],
         ctx: Context,
-    ) -> str:
+    ) -> str | InputRequiredResult:
         """Run a read-only HyperDbg script and return what it prints.
 
         For values hd_eval can't return: several at once, strings (%s, %ws),
@@ -155,10 +162,28 @@ def register_tools(mcp: MCPServer, *, read_only: bool) -> None:
         Mode, or a paused user-mode process in local VMI mode. Syntax and
         functions: hd_script_cookbook.
 
+        A script with a loop or functions of its own is confirmed first: it
+        runs on the target in kernel context, and one that never ends (a list
+        walk over a corrupt list) hangs it. Bound loops with a counter.
+
         Example: for (i = 0; i < 4; i++) { printf("%llx\\n", dq(@rsp + i * 8)); }
         """
         app = _app(ctx)
-        out = app.session.run_script(read_only_script(script))
+        read_only_script(script)
+        risky = unbounded_constructs(script)
+        if risky:
+            confirmed = await require_confirmation(
+                ctx,
+                "run a read-only script that may not terminate (it uses "
+                + ", ".join(risky)
+                + f"; a script that never ends hangs the target): {script}",
+            )
+            if isinstance(confirmed, InputRequiredResult):
+                return confirmed
+            if not confirmed:
+                app.audit.record("hd_script_eval", {}, status="denied")
+                return denial(ctx)
+        out = await anyio.to_thread.run_sync(app.session.run_script, script)
         app.audit.record("hd_script_eval", {}, status="ok")
         if not out.strip():
             return "(the script printed nothing)"

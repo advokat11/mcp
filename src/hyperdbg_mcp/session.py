@@ -210,6 +210,10 @@ _FAILURE_MARKERS = (
 )
 
 
+# Informational lines HyperDbg prints before a command's verdict.
+_NOTICE_PREFIXES = ("notice:",)
+
+
 def _reports_failure(output: str) -> bool:
     """HyperDbg commands return success and print why they did nothing.
 
@@ -217,11 +221,20 @@ def _reports_failure(output: str) -> bool:
     help text), `err, ...` or that a needed module is not loaded. Only the
     first line counts: some commands print a non-fatal `err,` between valid
     results (`!pcitree` without pci.ids). A progress line ("Attaching to
-    process 0x4 (4)...") comes before the verdict and is skipped.
+    process 0x4 (4)...") or a `notice:` (an event with `pid` in VMI mode
+    prints one before refusing a missing script) comes before the verdict and
+    is skipped.
     """
     lines = (line.strip() for line in output.splitlines())
     first = next(
-        (ln for ln in lines if ln and not ln.startswith(_ASYNC_ERRORS) and not ln.endswith("...")),
+        (
+            ln
+            for ln in lines
+            if ln
+            and not ln.startswith(_ASYNC_ERRORS)
+            and not ln.endswith("...")
+            and not ln.lower().startswith(_NOTICE_PREFIXES)
+        ),
         "",
     )
     if first.startswith(_FAILURE_PREFIXES):
@@ -242,7 +255,8 @@ _FAILURE_HINTS = (
     (
         "only valid if you connected to a debuggee in debugger-mode",
         "This command needs Debugger Mode (serial/pipe/net). Set the same event with "
-        "the VMI-mode equivalents: hd_hook_ept2 instead of hd_bp_set, hd_hook_monitor, ...",
+        "the VMI-mode equivalents: hd_hook_ept instead of hd_bp_set (hd_hook_ept2 for "
+        "kernel code only), hd_hook_monitor, ...",
     ),
     (
         "breaking to the debugger is not possible",
@@ -273,6 +287,28 @@ def _failure_hint(output: str) -> str:
     return ""
 
 
+# Lock holders that wait for a thread to halt (step, step_track, `gu`).
+_STEPPING = ("a step", "step_track", "the command 'gu")
+
+
+def _busy_message(holder: str | None, timeout: float) -> str:
+    """Why the session lock could not be taken, naming what holds it."""
+    held = f"{holder} has" if holder else "another command has"
+    msg = f"{held} held the session for over {timeout:.0f}s."
+    if holder is None or holder.startswith(_STEPPING):
+        msg += (
+            " A step waits for a thread that may never halt (the debuggee exited "
+            "mid-step, or is blocked in the kernel). Try hd_exec_pause; if that does "
+            "not bring the tools back, restart the server."
+        )
+    else:
+        msg += (
+            " It is still running inside libhyperdbg (a driver or VMM call can take "
+            "minutes, or hang). Wait and retry; if it never finishes, restart the server."
+        )
+    return msg
+
+
 class HyperDbgSession:
     """Owns the libhyperdbg handle and serializes access to it.
 
@@ -289,6 +325,7 @@ class HyperDbgSession:
         self._dll = dll or ffi.load_libhyperdbg()
         self._output: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
+        self._holder: str | None = None  # what holds _lock, for the busy error
         self._connected = False
         self._mode: str | None = None  # "local" | "remote"
         # Remote debuggee resumed: libhyperdbg's continue blocks until the next
@@ -738,7 +775,10 @@ class HyperDbgSession:
         with self._ops():
             self._discard()
             if args:
-                ok = self._dll.hyperdbg_u_start_process_with_args(path, args)
+                # libhyperdbg hands args to CreateProcessW as the whole command
+                # line, whose first token is argv[0]: without the path in front
+                # the target loses its first argument (HyperDbg/HyperDbg#713).
+                ok = self._dll.hyperdbg_u_start_process_with_args(path, f'"{path}" {args}')
             else:
                 ok = self._dll.hyperdbg_u_start_process(path)
             output = self._drain_settled() if not ok else ""
@@ -881,7 +921,7 @@ class HyperDbgSession:
 
     # ----- commands -------------------------------------------------------- #
     @contextmanager
-    def _ops(self, timeout: float | None = None):
+    def _ops(self, timeout: float | None = None, what: str | None = None):
         """Serialize a libhyperdbg call, giving up instead of hanging forever.
 
         A step or gu can wait for a halt that never comes (the thread was in a
@@ -891,22 +931,22 @@ class HyperDbgSession:
         the client gets an error it can act on.
         """
         timeout = _OPS_TIMEOUT_S if timeout is None else timeout
+        # The method that asked for the lock: frame 0 is this generator, 1 is
+        # contextmanager's __enter__.
+        what = what or sys._getframe(2).f_code.co_name
         if not self._lock.acquire(timeout=timeout):
-            raise HyperDbgError(
-                f"another command has held the session for {timeout:.0f}s: it is most "
-                "likely a step waiting for a thread that will never halt (the debuggee "
-                "exited mid-step, or is blocked in the kernel). Try hd_exec_pause; if "
-                "that does not bring the tools back, restart the server."
-            )
+            raise HyperDbgError(_busy_message(self._holder, timeout))
+        self._holder = what
         try:
             yield
         finally:
+            self._holder = None
             self._lock.release()
 
     def run_command(self, command: str) -> str:
         """Run a HyperDbg CLI command and return its captured text output."""
         self._require_connected()
-        with self._ops():
+        with self._ops(what=f"the command {command[:80]!r}"):
             self._discard()  # discard anything stale before we start
             _mark_interpreter_used()
             status = self._dll.hyperdbg_u_run_command(command.encode("utf-8"))
@@ -1043,7 +1083,8 @@ class HyperDbgSession:
             # VMI mode HyperDbg answers "bl" with the same explanation.
             raise PreconditionError(
                 "software breakpoints need Debugger Mode: in VMI mode use an EPT hook "
-                "instead (hd_hook_ept2 on the code address, hd_hook_monitor on the data)"
+                "instead (hd_hook_ept on the code address - hd_hook_ept2 for kernel code "
+                "only - and hd_hook_monitor on the data)"
             )
         with self._ops():
             self._dll.hyperdbg_u_set_breakpoint(address, pid, tid, core)
@@ -1113,7 +1154,7 @@ class HyperDbgSession:
         }.get(mode)
         if fn is None:
             raise HyperDbgError(f"unknown step mode {mode!r} (use over|in|instr)")
-        with self._ops():
+        with self._ops(what=f"a step ({mode})"):
             self._discard()
             try:
                 fn()
@@ -1201,6 +1242,25 @@ class HyperDbgSession:
             raise HyperDbgError(
                 f"{what} reads {', '.join(reads)} from the debugged process, which is "
                 "running: pause it first (hd_exec_pause)."
+            )
+
+    def require_events_safe(self, what: str) -> None:
+        """Refuse to set or clear an event while a local user-mode process is paused.
+
+        Applying (or removing) an EPT hook broadcasts a DPC to every core and
+        waits for all of them; the core that holds the paused thread never runs
+        it, so the machine bugchecks with CLOCK_WATCHDOG_TIMEOUT (0x101). Seen
+        twice on hardware, full dump analysed (HyperDbg/HyperDbg#711). The same
+        hook applied while the process runs is fine.
+        """
+        if self._mode != "local":
+            return
+        if self.engine_context() == "target":
+            raise PreconditionError(
+                f"refusing to {what} while the debugged user-mode process is paused: "
+                "HyperDbg applies events on every core, and the core holding the paused "
+                "thread never answers, which hangs the machine (bugcheck 0x101, "
+                "HyperDbg/HyperDbg#711). Resume it first (hd_exec_continue), then retry."
             )
 
     def eval_expression(self, expr: str) -> int:

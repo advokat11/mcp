@@ -107,6 +107,21 @@ def _what_lvalue_writes(lhs: list[str]) -> str | None:
     return None
 
 
+def unbounded_constructs(script: str) -> list[str]:
+    """What in a script may keep it running forever: loops and its own functions.
+
+    A read-only script still runs on the target, in kernel context: a `while`
+    over a corrupt list never ends, and a function the script defines can
+    recurse. Straight-line code always finishes.
+    """
+    toks = tokens(script)
+    found = [kw for kw in ("while", "for", "do") if kw in toks]
+    defined = _defined_functions(toks)
+    if defined:
+        found.append("functions it defines (" + ", ".join(sorted(defined)) + ")")
+    return found
+
+
 def read_only_script(script: str) -> str:
     """Require a script that only reads and prints (for read-only tools).
 
